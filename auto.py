@@ -2,193 +2,201 @@ import cv2
 import numpy as np
 import pyautogui
 import time
+import keyboard
 import win32gui
 import win32con
-import win32api
-import threading
-import keyboard
 import os
 
-# ---------------- 全局配置 ----------------
+# ==============================
+# 配置
+# ==============================
 GAME_TITLE = "《战舰世界》"
-BASE_RES = (1920, 1080)
-STATE = "IDLE"
-RUNNING = False
-last_action_time = 0
-auto_nav_checked = False
+TEMPLATE_DIR = "templates"
+DEBUG = True
 
-# ---------------- 工具函数 ----------------
+STATE_IDLE = "idle"
+STATE_LOADING = "loading"
+STATE_COMBAT = "combat"
+STATE_END = "end"
 
-def log(msg):
-    print(time.strftime("[%H:%M:%S] "), msg)
+running = False
+window_rect = None
+current_state = STATE_IDLE
 
-def press_key_hex(hex_key_code):
-    """底层硬件键盘事件（DirectX兼容）"""
-    win32api.keybd_event(hex_key_code, 0, 0, 0)
-    time.sleep(0.05)
-    win32api.keybd_event(hex_key_code, 0, win32con.KEYEVENTF_KEYUP, 0)
 
-def open_map():
-    log("[ACTION] 打开地图 (M)")
-    press_key_hex(0x4D)  # 'M'
-    time.sleep(0.5)
-
-def close_map():
-    log("[ACTION] 关闭地图 (M)")
-    press_key_hex(0x4D)
-    time.sleep(0.5)
+# ==============================
+# 基础函数
+# ==============================
+def dbg(msg):
+    if DEBUG:
+        print(f"[INFO] {time.strftime('%H:%M:%S')} {msg}")
 
 def get_window_rect(title):
     hwnd = win32gui.FindWindow(None, title)
     if hwnd == 0:
-        log(f"[ERROR] 未找到窗口: {title}")
-        return None
+        raise Exception(f"未找到窗口: {title}")
     rect = win32gui.GetClientRect(hwnd)
     left, top = win32gui.ClientToScreen(hwnd, (0, 0))
-    width, height = rect[2] - rect[0], rect[3] - rect[1]
-    log(f"[INFO] 窗口 '{title}' 客户区坐标: ({left},{top}) 大小 {width}x{height}")
-    return {'hwnd': hwnd, 'left': left, 'top': top, 'width': width, 'height': height}
+    right, bottom = win32gui.ClientToScreen(hwnd, (rect[2], rect[3]))
+    return {
+        "hwnd": hwnd,
+        "left": left,
+        "top": top,
+        "right": right,
+        "bottom": bottom,
+        "width": right - left,
+        "height": bottom - top
+    }
 
-def get_window_screenshot(window):
-    """截取窗口画面"""
-    x, y, w, h = window['left'], window['top'], window['width'], window['height']
-    img = pyautogui.screenshot(region=(x, y, w, h))
+def capture_window():
+    global window_rect
+    if not window_rect:
+        return None
+    img = pyautogui.screenshot(region=(window_rect["left"], window_rect["top"], window_rect["width"], window_rect["height"]))
     return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
-def find_template(screen, template_path, threshold=0.6, base_res=(1920,1080), window_res=None):
-    """自动适配缩放的模板匹配"""
+def find_template(screen, window_rect, template_path, threshold=0.8):
     if not os.path.exists(template_path):
-        log(f"[WARN] 模板不存在: {template_path}")
-        return None, 0.0
-
-    template = cv2.imread(template_path)
-    if template is None or screen is None:
-        return None, 0.0
-
-    if window_res is not None:
-        scale_x = window_res[0] / base_res[0]
-        scale_y = window_res[1] / base_res[1]
-        template = cv2.resize(template, (int(template.shape[1]*scale_x), int(template.shape[0]*scale_y)))
-
-    img_gray = cv2.cvtColor(screen, cv2.COLOR_BGR2GRAY)
-    tpl_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
-    res = cv2.matchTemplate(img_gray, tpl_gray, cv2.TM_CCOEFF_NORMED)
-    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
-
+        return None
+    tpl = cv2.imread(template_path)
+    res = cv2.matchTemplate(screen, tpl, cv2.TM_CCOEFF_NORMED)
+    _, max_val, _, max_loc = cv2.minMaxLoc(res)
     if max_val >= threshold:
-        h, w = template.shape[:2]
-        center = (max_loc[0] + w // 2, max_loc[1] + h // 2)
-        log(f"[MATCH] {os.path.basename(template_path)} match={max_val:.3f} at {center}")
-        return center, max_val
-    else:
-        log(f"[DEBUG] tpl no match {os.path.basename(template_path)} thr={threshold:.2f} max={max_val:.3f}")
-        return None, max_val
+        x, y = max_loc
+        cx = window_rect["left"] + x + tpl.shape[1] // 2
+        cy = window_rect["top"] + y + tpl.shape[0] // 2
+        return (cx, cy)
+    return None
 
-def click_in_window(window, pos):
-    """点击游戏窗口内部坐标"""
-    gx = window['left'] + pos[0]
-    gy = window['top'] + pos[1]
-    pyautogui.moveTo(gx, gy, duration=0.15)
+def game_click(pos):
+    pyautogui.moveTo(pos[0], pos[1])
     pyautogui.click()
-    log(f"[CLICK] 点击游戏坐标 {pos} (全屏 {gx},{gy})")
+    dbg(f"[CLICK] 点击位置 {pos}")
 
-# ---------------- 状态机 ----------------
+# ==============================
+# 动作确认机制
+# ==============================
+def click_with_confirm(click_templates, confirm_templates, max_retry=3, delay_between=2.0, threshold=0.8):
+    """
+    点击按钮后确认是否切换成功。
+    click_templates: [list] 可能的按钮图片路径
+    confirm_templates: [list] 进入后应检测到的图标路径
+    """
+    for attempt in range(max_retry):
+        screen = capture_window()
+        if screen is None:
+            dbg("[ERROR] 无法截取游戏画面")
+            return False
 
+        # 查找可能的点击按钮
+        click_pos = None
+        for tpl in click_templates:
+            pos = find_template(screen, window_rect, os.path.join(TEMPLATE_DIR, tpl), threshold)
+            if pos:
+                click_pos = pos
+                dbg(f"[MATCH] 发现按钮 {tpl}，准备点击")
+                break
+
+        if click_pos:
+            game_click(click_pos)
+            dbg("[ACTION] 点击后等待确认中...")
+            time.sleep(delay_between)
+
+            # 检查确认标志
+            screen = capture_window()
+            for confirm_tpl in confirm_templates:
+                confirm_pos = find_template(screen, window_rect, os.path.join(TEMPLATE_DIR, confirm_tpl), threshold)
+                if confirm_pos:
+                    dbg(f"[CONFIRM] 成功检测到 {confirm_tpl} ✅")
+                    return True
+            dbg(f"[WARN] 未检测到确认标志，准备重试 ({attempt+1}/{max_retry})")
+        else:
+            dbg(f"[WARN] 未找到任何匹配按钮，重试 ({attempt+1}/{max_retry})")
+
+        time.sleep(delay_between)
+    dbg("[FAIL] 点击确认失败 ❌")
+    return False
+
+
+# ==============================
+# 主流程逻辑
+# ==============================
 def main_loop():
-    global STATE, RUNNING, last_action_time, auto_nav_checked
+    global current_state
 
-    window = get_window_rect(GAME_TITLE)
-    if not window:
-        log("[FATAL] 未找到游戏窗口，退出。")
-        return
+    dbg("程序启动，等待检测状态...")
+    while running:
+        screen = capture_window()
+        if screen is None:
+            dbg("无法截取游戏窗口，请确认窗口存在")
+            time.sleep(2)
+            continue
 
-    while RUNNING:
-        try:
-            screen = get_window_screenshot(window)
-            res = (window['width'], window['height'])
+        if current_state == STATE_IDLE:
+            dbg("[STATE] 港口状态，尝试点击加入战斗按钮")
+            success = click_with_confirm(
+                ["start_battle.png", "start_battle_alt.png"],
+                ["battle_ui_indicator.png"],
+                max_retry=3,
+                delay_between=2.5
+            )
+            if success:
+                dbg("[STATE] 成功进入加载阶段")
+                current_state = STATE_LOADING
+            else:
+                dbg("[STATE] 点击失败，保持港口状态")
+                time.sleep(3)
 
-            if STATE == "IDLE":
-                pos, conf = find_template(screen, "templates/start_battle.png", 0.6, BASE_RES, res)
-                if pos:
-                    click_in_window(window, pos)
-                    STATE = "LOADING"
-                    last_action_time = time.time()
-                    continue
+        elif current_state == STATE_LOADING:
+            dbg("[STATE] 加载中，检测战斗界面是否出现...")
+            if find_template(screen, window_rect, os.path.join(TEMPLATE_DIR, "auto_pilot_on.png"), 0.8):
+                dbg("[STATE] 检测到战斗UI，进入战斗状态")
+                current_state = STATE_COMBAT
+            else:
+                time.sleep(2)
 
-            elif STATE == "LOADING":
-                pos, conf = find_template(screen, "templates/battle_ui_indicator.png", 0.6, BASE_RES, res)
-                if pos:
-                    log("[STATE] 检测到战斗UI -> 转入 MAP_NAV")
-                    STATE = "MAP_NAV"
-                    continue
+        elif current_state == STATE_COMBAT:
+            dbg("[STATE] 战斗中，检测胜利或失败...")
+            if find_template(screen, window_rect, os.path.join(TEMPLATE_DIR, "victory.png"), 0.8) or \
+               find_template(screen, window_rect, os.path.join(TEMPLATE_DIR, "defeat.png"), 0.8):
+                dbg("[STATE] 检测到结算界面，进入END阶段")
+                current_state = STATE_END
+            else:
+                time.sleep(3)
 
-                if time.time() - last_action_time > 60:
-                    log("[TIMEOUT] 匹配超时，重试返回大厅")
-                    STATE = "IDLE"
+        elif current_state == STATE_END:
+            dbg("[STATE] 结算阶段，检测返回港口按钮")
+            if click_with_confirm(
+                ["return_port.png"],
+                ["start_battle.png", "start_battle_alt.png"],
+                max_retry=3,
+                delay_between=2.5
+            ):
+                dbg("[STATE] 返回港口成功，恢复IDLE状态")
+                current_state = STATE_IDLE
+            else:
+                dbg("[STATE] 未能返回港口，重试中")
+                time.sleep(3)
 
-            elif STATE == "MAP_NAV":
-                open_map()
-                found = False
-                for tpl in ["cap_point_A.png", "cap_point_B.png", "cap_point_C.png"]:
-                    path = os.path.join("templates", tpl)
-                    pos, conf = find_template(screen, path, 0.6, BASE_RES, res)
-                    if pos:
-                        click_in_window(window, pos)
-                        found = True
-                        time.sleep(0.3)
-                close_map()
-                auto_nav_checked = True
-                STATE = "COMBAT"
-                continue
 
-            elif STATE == "COMBAT":
-                # 检查是否失去自动导航
-                if not auto_nav_checked:
-                    log("[CHECK] 检测到无自动导航 -> 再次进入 MAP_NAV")
-                    STATE = "MAP_NAV"
-                    continue
-
-                # 检测胜利/失败
-                for tpl in ["victory.png", "defeat.png"]:
-                    path = os.path.join("templates", tpl)
-                    pos, conf = find_template(screen, path, 0.7, BASE_RES, res)
-                    if pos:
-                        log("[STATE] 战斗结束 -> 返回大厅")
-                        STATE = "RESPAWN"
-                        break
-
-            elif STATE == "RESPAWN":
-                pos, conf = find_template(screen, "templates/back_to_lobby.png", 0.6, BASE_RES, res)
-                if pos:
-                    click_in_window(window, pos)
-                    STATE = "IDLE"
-                    continue
-
-            time.sleep(0.5)
-
-        except Exception as e:
-            log(f"[ERROR] {e}")
-            time.sleep(1)
-
-    log("[STOP] 已安全停止主循环。")
-
-# ---------------- 控制逻辑 ----------------
-
-def toggle_run():
-    global RUNNING
-    RUNNING = not RUNNING
-    if RUNNING:
-        log("[F8] 启动自动脚本")
-        threading.Thread(target=main_loop, daemon=True).start()
-    else:
-        log("[F8] 停止自动脚本")
-
-keyboard.add_hotkey("F8", toggle_run)
-log("按 F8 启动/停止脚本。按 Ctrl+C 退出。")
-
-try:
+# ==============================
+# 启动入口
+# ==============================
+if __name__ == "__main__":
+    dbg("按 F8 启动 / 停止脚本")
     while True:
-        time.sleep(1)
-except KeyboardInterrupt:
-    RUNNING = False
-    log("用户退出。")
+        if keyboard.is_pressed("f8"):
+            time.sleep(0.3)
+            if not running:
+                try:
+                    window_rect = get_window_rect(GAME_TITLE)
+                    dbg(f"锁定窗口 {GAME_TITLE}: {window_rect}")
+                    running = True
+                    main_loop()
+                except Exception as e:
+                    dbg(f"[ERROR] {e}")
+                    running = False
+            else:
+                dbg("脚本已停止")
+                running = False
+        time.sleep(0.1)
